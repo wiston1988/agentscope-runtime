@@ -12,9 +12,11 @@ from agentscope_runtime.engine.schemas.agent_schemas import (
     Role,
     TextContent,
 )
-from agentscope_runtime.engine.services.tablestore_memory_service import (
-    SearchStrategy,
+from agentscope_runtime.engine.services.memory import (
     TablestoreMemoryService,
+)
+from agentscope_runtime.engine.services.memory.tablestore_memory_service import (  # noqa: E501
+    SearchStrategy,
 )
 from agentscope_runtime.engine.services.utils.tablestore_service_utils import (
     convert_message_to_tablestore_document,
@@ -34,7 +36,7 @@ def create_message(role: str, content: str) -> Message:
 @pytest.fixture
 def mock_knowledge_store():
     with patch(
-        "agentscope_runtime.engine.services."
+        "agentscope_runtime.engine.services.memory."
         "tablestore_memory_service.AsyncKnowledgeStore",
     ) as mock:
         instance = mock.return_value
@@ -49,13 +51,13 @@ def mock_knowledge_store():
         yield instance
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def mock_embedding_model():
     with patch(
-        "agentscope_runtime.engine.services."
-        "tablestore_memory_service.DashScopeEmbeddings",
-    ) as mock:
-        instance = mock.return_value
+        "agentscope_runtime.engine.services.memory.tablestore_memory_service"
+        ".DashScopeEmbeddings",
+    ) as mock_cls:
+        instance = mock_cls.return_value
         instance.embed_documents = MagicMock(
             side_effect=lambda texts: [[0.1, 0.2, 0.3] for _ in texts],
         )
@@ -99,23 +101,6 @@ async def tablestore_memory_service_vector(
         yield tablestore_memory_service_vector
     finally:
         await tablestore_memory_service_vector.stop()
-
-
-# Tests for __init__ method
-def test_init_with_vector_strategy_without_embedding_model():
-    mock_tablestore_client = MagicMock()
-
-    with pytest.raises(ValueError) as exc_info:
-        TablestoreMemoryService(
-            tablestore_client=mock_tablestore_client,
-            search_strategy=SearchStrategy.VECTOR,
-            embedding_model=None,
-        )
-
-    assert (
-        str(exc_info.value)
-        == "Embedding model is required when search strategy is VECTOR."
-    )
 
 
 def test_init_with_full_text_strategy():

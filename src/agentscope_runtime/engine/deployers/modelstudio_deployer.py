@@ -4,27 +4,25 @@
 # pylint:disable=ungrouped-imports, arguments-renamed, protected-access
 #
 # flake8: noqa: E501
+import json
 import logging
 import os
 import time
-import uuid
 from pathlib import Path
 from typing import Dict, Optional, List, Union, Tuple
 
+import requests
 from pydantic import BaseModel, Field
 
 from .adapter.protocol_adapter import ProtocolAdapter
 from .base import DeployManager
 from .local_deployer import LocalDeployManager
-from .utils.service_utils import (
-    ServicesConfig,
-)
+from .utils.detached_app import get_bundle_entry_script
 from .utils.wheel_packager import (
     generate_wrapper_project,
     build_wheel,
     default_deploy_name,
 )
-from ..runner import Runner
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +88,15 @@ class ModelstudioConfig(BaseModel):
 
     @classmethod
     def from_env(cls) -> "ModelstudioConfig":
+        raw_ws = os.environ.get("MODELSTUDIO_WORKSPACE_ID")
+        ws = raw_ws.strip() if isinstance(raw_ws, str) else ""
+        resolved_ws = ws if ws else "default"
         return cls(
             endpoint=os.environ.get(
                 "MODELSTUDIO_ENDPOINT",
                 "bailian.cn-beijing.aliyuncs.com",
             ),
-            workspace_id=os.environ.get("MODELSTUDIO_WORKSPACE_ID"),
+            workspace_id=resolved_ws,
             access_key_id=os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID"),
             access_key_secret=os.environ.get(
                 "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
@@ -107,8 +108,6 @@ class ModelstudioConfig(BaseModel):
 
     def ensure_valid(self) -> None:
         missing = []
-        if not self.workspace_id:
-            missing.append("MODELSTUDIO_WORKSPACE_ID")
         if not self.access_key_id:
             missing.append("ALIBABA_CLOUD_ACCESS_KEY_ID")
         if not self.access_key_secret:
@@ -201,16 +200,6 @@ async def _oss_create_bucket_if_not_exists(client, bucket_name: str) -> None:
         )
 
 
-def _create_bucket_name(prefix: str, base_name: str) -> str:
-    import re as _re
-
-    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-    base = _re.sub(r"\s+", "-", base_name)
-    base = _re.sub(r"[^a-zA-Z0-9-]", "", base).lower().strip("-")
-    name = f"{prefix}-{base}-{ts}"
-    return name[:63]
-
-
 async def _oss_put_and_presign(
     client,
     bucket_name: str,
@@ -230,6 +219,180 @@ async def _oss_put_and_presign(
         expires=_dt.timedelta(minutes=180),
     )
     return pre.url
+
+
+def _upload_to_oss_with_credentials(
+    api_response,
+    file_path,
+) -> str:
+    response_data = (
+        json.loads(api_response)
+        if isinstance(api_response, str)
+        else api_response
+    )
+
+    try:
+        body = response_data["body"]
+        data = body.get("Data")
+        if data is None:
+            messages = [
+                "\n❌ Configuration Error: "
+                "The current RAM user is not assigned to target workspace.",
+                "Bailian requires RAM users to be associated with "
+                "at least one workspace to use temporary storage.",
+                "\n🔧 How to resolve:",
+                "1. Ask the primary account to log in to the "
+                "Bailian Console: https://bailian.console.aliyun.com",
+                "2. Go to [Permission Management]",
+                "3. Go to [Add User]",
+                "4. Assign the user to a workspace",
+                "\n💡 Note: If you are not the primary account holder,"
+                " please contact your administrator to complete this step.",
+                "=" * 80,
+            ]
+
+            for msg in messages:
+                logger.error(msg)
+
+            raise ValueError(
+                "RAM user is not assigned to any workspace in Bailian",
+            )
+        param = data["Param"]
+        signed_url = param["Url"]
+        headers = param["Headers"]
+    except KeyError as e:
+        raise ValueError(f"Missing expected field in API response: {e}") from e
+    try:
+        with open(file_path, "rb") as file:
+            response = requests.put(signed_url, data=file, headers=headers)
+        logger.info("OSS upload status code: %d", response.status_code)
+        response.raise_for_status()  # Raises for 4xx/5xx
+        logger.info("File uploaded successfully using requests")
+        return data["TempStorageLeaseId"]
+    except Exception as e:
+        logger.error("Failed to upload file to OSS: %s", e)
+        raise
+
+
+def _get_presign_url_and_upload_to_oss(
+    cfg: ModelstudioConfig,
+    wheel_path: Path,
+) -> str:
+    """
+    Request a temporary storage lease, obtain a pre-signed OSS URL, and upload the file.
+
+    Args:
+        cfg: ModelStudio configuration with credentials and endpoint.
+        wheel_path: Path to the wheel file to upload.
+
+    Returns:
+        The TempStorageLeaseId returned by the service.
+
+    Raises:
+        Exception: Any error from the SDK or upload process (not swallowed).
+    """
+    try:
+        config = open_api_models.Config(
+            access_key_id=cfg.access_key_id,
+            access_key_secret=cfg.access_key_secret,
+        )
+        config.endpoint = cfg.endpoint
+        client_modelstudio = ModelstudioClient(config)
+
+        filename = wheel_path.name
+        size = wheel_path.stat().st_size
+
+        apply_temp_storage_lease_request = (
+            ModelstudioTypes.ApplyTempStorageLeaseRequest(
+                file_name=filename,
+                size_in_bytes=size,
+            )
+        )
+        runtime = util_models.RuntimeOptions()
+        headers = {}
+        workspace_id = getattr(cfg, "workspace_id", "default")
+        try:
+            response = (
+                client_modelstudio.apply_temp_storage_lease_with_options(
+                    workspace_id,
+                    apply_temp_storage_lease_request,
+                    headers,
+                    runtime,
+                )
+            )
+        except Exception as error:
+            logger.error(
+                "Error during temporary storage lease or upload: %s",
+                error,
+            )
+            error_code = None
+            recommend_url = None
+            if hasattr(error, "code"):
+                error_code = error.code
+            if hasattr(error, "data") and isinstance(error.data, dict):
+                recommend_url = error.data.get("Recommend")
+
+            if error_code == "NoPermission":
+                messages = [
+                    "\n❌ Permission Denied (NoPermission)",
+                    "The current account does not have permission to apply "
+                    "for temporary storage (ApplyTempStorageLease).",
+                    "\n🔧 How to resolve:",
+                    "1. Ask the primary account holder (or an administrator)"
+                    " to grant your RAM user the following permission:",
+                    "   - Action: `AliyunBailianDataFullAccess`",
+                    "\n2. Steps to grant permission:",
+                    "   - Go to Alibaba Cloud RAM Console: https://ram.console.aliyun.com/users",
+                    "   - Locate your RAM user",
+                    "   - Click 'Add Permissions' and attach a policy that includes "
+                    "`AliyunBailianDataFullAccess`",
+                    "\n3. For further diagnostics:",
+                ]
+                official_doc_link = "https://help.aliyun.com/zh/ram/"
+                if recommend_url:
+                    messages.append(
+                        f"   - Official troubleshooting link: {recommend_url}",
+                    )
+                else:
+                    messages.append(
+                        "   - Visit the Alibaba Cloud API troubleshooting page",
+                    )
+                messages.append(
+                    f"   - Official document link: {official_doc_link or 'N/A'}",
+                )
+                messages.append(
+                    "\n💡 Note: If you are not an administrator, please "
+                    "contact your cloud account administrator for assistance.",
+                )
+                messages.append("=" * 80)
+
+                # 一次性记录多行日志（每行单独一条日志，便于解析）
+                for msg in messages:
+                    logger.error(msg)
+
+            logger.error("Original error details: %s", error)
+            raise
+
+        temp_storage_lease_id = _upload_to_oss_with_credentials(
+            response.to_map(),
+            wheel_path,
+        )
+        return temp_storage_lease_id
+
+    except Exception as error:
+        # Log detailed error information
+        logger.error(
+            "Error during temporary storage upload: %s",
+            error,
+        )
+        if hasattr(error, "message"):
+            logger.error("Error message: %s", error.message)
+        if hasattr(error, "data") and isinstance(error.data, dict):
+            recommend = error.data.get("Recommend")
+            if recommend:
+                logger.error("Diagnostic recommendation: %s", recommend)
+        # Re-raise the exception to avoid silent failures
+        raise
 
 
 async def _modelstudio_deploy(
@@ -421,7 +584,7 @@ class ModelstudioDeployManager(DeployManager):
         build_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info("Generating wrapper project for %s", name)
-        wrapper_project_dir, _ = await generate_wrapper_project(
+        wrapper_project_dir, _ = generate_wrapper_project(
             build_root=build_dir,
             user_project_dir=project_dir,
             start_cmd=cmd,
@@ -430,7 +593,7 @@ class ModelstudioDeployManager(DeployManager):
         )
 
         logger.info("Building wheel under %s", wrapper_project_dir)
-        wheel_path = await build_wheel(wrapper_project_dir)
+        wheel_path = build_wheel(wrapper_project_dir)
         return wheel_path, name
 
     def _generate_env_file(
@@ -501,32 +664,19 @@ class ModelstudioDeployManager(DeployManager):
         agent_id: Optional[str] = None,
         agent_desc: Optional[str] = None,
         telemetry_enabled: bool = True,
-    ) -> Tuple[str, str, str]:
-        logger.info("Uploading wheel to OSS and generating presigned URL")
-        client = _oss_get_client(self.oss_config)
-
-        bucket_suffix = (
-            os.getenv("MODELSTUDIO_WORKSPACE_ID", str(uuid.uuid4()))
-        ).lower()
-        bucket_name = (f"tmp-code-deploy-" f"{bucket_suffix}")[:63]
-        await _oss_create_bucket_if_not_exists(client, bucket_name)
-        filename = wheel_path.name
-        with wheel_path.open("rb") as f:
-            file_bytes = f.read()
-        artifact_url = await _oss_put_and_presign(
-            client,
-            bucket_name,
-            filename,
-            file_bytes,
+    ) -> Tuple[str, str]:
+        logger.info("Uploading wheel to OSS")
+        temp_storage_lease_id = _get_presign_url_and_upload_to_oss(
+            self.modelstudio_config,
+            wheel_path,
         )
-
         logger.info("Triggering Modelstudio Full-Code deploy for %s", name)
         deploy_identifier = await _modelstudio_deploy(
             agent_desc=agent_desc,
             agent_id=agent_id,
             cfg=self.modelstudio_config,
-            file_url=artifact_url,
-            filename=filename,
+            file_url=temp_storage_lease_id,
+            filename=wheel_path.name,
             deploy_name=name,
             telemetry_enabled=telemetry_enabled,
         )
@@ -548,13 +698,13 @@ class ModelstudioDeployManager(DeployManager):
             if deploy_identifier
             else ""
         )
-        return artifact_url, console_url, deploy_identifier
+        return console_url, deploy_identifier
 
     async def deploy(
         self,
-        runner: Optional[Runner] = None,
+        app=None,
+        runner=None,
         endpoint_path: str = "/process",
-        services_config: Optional[Union[ServicesConfig, dict]] = None,
         protocol_adapters: Optional[list[ProtocolAdapter]] = None,
         requirements: Optional[Union[str, List[str]]] = None,
         extra_packages: Optional[List[str]] = None,
@@ -577,7 +727,7 @@ class ModelstudioDeployManager(DeployManager):
         """
         Package the project, upload to OSS and trigger ModelStudio deploy.
 
-        Returns a dict containing deploy_id, wheel_path, artifact_url (if uploaded),
+        Returns a dict containing deploy_id, wheel_path, url (if uploaded),
         resource_name (deploy_name), and workspace_id.
         """
         if not agent_id:
@@ -587,30 +737,26 @@ class ModelstudioDeployManager(DeployManager):
                     "or external_whl_path must be provided.",
                 )
 
-        # convert services_config to Model body
-        if services_config and isinstance(services_config, dict):
-            services_config = ServicesConfig(**services_config)
-
         try:
             if runner:
-                agent = runner._agent
                 if "agent" in kwargs:
                     kwargs.pop("agent")
 
                 # Create package project for detached deployment
                 project_dir = await LocalDeployManager.create_detached_project(
-                    agent=agent,
+                    app=app,
                     endpoint_path=endpoint_path,
-                    services_config=services_config,  # type: ignore[arg-type]
                     protocol_adapters=protocol_adapters,
-                    custom_endpoints=custom_endpoints,  # Pass custom endpoints
+                    custom_endpoints=custom_endpoints,
                     requirements=requirements,
                     extra_packages=extra_packages,
+                    port=8080,
                     **kwargs,
                 )
                 if project_dir:
                     self._generate_env_file(project_dir, environment)
-                cmd = "python main.py"
+                entry_script = get_bundle_entry_script(project_dir)
+                cmd = f"python {entry_script}"
                 deploy_name = deploy_name or default_deploy_name()
 
             if agent_id:
@@ -628,10 +774,17 @@ class ModelstudioDeployManager(DeployManager):
                         f"External wheel file not found: {wheel_path}",
                     )
                 name = deploy_name or default_deploy_name()
-                # 如果是更新agent，且没有传deploy_name, 则不更新名字
+                # Don't change name if agent was not updated and
+                # deploye_name was missing
                 if agent_id and (deploy_name is None):
                     name = None
+                logger.info(
+                    "Using external wheel file: %s",
+                    wheel_path,
+                )
+
             else:
+                logger.info("Building wheel package from project")
                 (
                     wheel_path,
                     name,
@@ -642,16 +795,15 @@ class ModelstudioDeployManager(DeployManager):
                     telemetry_enabled=telemetry_enabled,
                 )
 
-            artifact_url = ""
             console_url = ""
             deploy_identifier = ""
             if not skip_upload:
-                # Only require cloud SDKs and credentials when performing upload/deploy
+                # Only require cloud SDKs and credentials when performing
+                # upload/deploy
                 _assert_cloud_sdks_available()
                 self.oss_config.ensure_valid()
                 self.modelstudio_config.ensure_valid()
                 (
-                    artifact_url,
                     console_url,
                     deploy_identifier,
                 ) = await self._upload_and_deploy(
@@ -664,11 +816,12 @@ class ModelstudioDeployManager(DeployManager):
 
             result: Dict[str, str] = {
                 "wheel_path": str(wheel_path),
-                "artifact_url": artifact_url,
                 "resource_name": name,
-                "workspace_id": self.modelstudio_config.workspace_id or "",
                 "url": console_url,
             }
+            env_ws = os.environ.get("MODELSTUDIO_WORKSPACE_ID")
+            if env_ws and env_ws.strip():
+                result["workspace_id"] = env_ws.strip()
             if deploy_identifier:
                 result["deploy_id"] = deploy_identifier
 
@@ -676,7 +829,10 @@ class ModelstudioDeployManager(DeployManager):
         except Exception as e:
             # Print richer error message to improve UX
             err_text = str(e)
-            logger.error("Failed to deploy to modelstudio: %s", err_text)
+            logger.error(
+                "Failed to deploy to modelstudio: %s",
+                err_text,
+            )
             raise
 
     async def stop(self) -> None:  # pragma: no cover - not supported yet

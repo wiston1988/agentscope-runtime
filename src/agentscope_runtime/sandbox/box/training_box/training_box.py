@@ -206,7 +206,7 @@ class TrainingSandbox(Sandbox):
 
 
 @SandboxRegistry.register(
-    build_image_uri("runtime-sandbox-appworld", arm64_compatible=False),
+    build_image_uri("runtime-sandbox-appworld"),
     sandbox_type=SandboxType.APPWORLD,
     runtime_config={"shm_size": "5.06gb"},
     security_level="medium",
@@ -251,7 +251,7 @@ DATASET_SUB_TYPE = os.environ.get("DATASET_SUB_TYPE", "multi_turn")
 
 
 @SandboxRegistry.register(
-    build_image_uri("runtime-sandbox-bfcl", arm64_compatible=False),
+    build_image_uri("runtime-sandbox-bfcl"),
     sandbox_type=SandboxType.BFCL,
     runtime_config={"shm_size": "8.06gb"},
     security_level="medium",
@@ -283,48 +283,6 @@ class BFCLSandbox(TrainingSandbox):
         base_url: Optional[str] = None,
         bearer_token: Optional[str] = None,
         sandbox_type: SandboxType = SandboxType.BFCL,
-    ):
-        """
-        Initialize the Training Sandbox.
-
-        Args:
-            sandbox_id (Optional[str]): Unique identifier for the sandbox.
-            timeout (int): Maximum time allowed for sandbox operations.
-            base_url (Optional[str]): Base URL for sandbox API.
-            bearer_token (Optional[str]): Authentication token for API access.
-        """
-        super().__init__(
-            sandbox_id,
-            timeout,
-            base_url,
-            bearer_token,
-            sandbox_type,
-        )
-
-
-@SandboxRegistry.register(
-    build_image_uri("runtime-sandbox-webshop", arm64_compatible=False),
-    sandbox_type=SandboxType.WEBSHOP,
-    runtime_config={"shm_size": "5.06gb"},
-    security_level="medium",
-    timeout=30,
-    description="webshop Sandbox",
-)
-class WebShopSandbox(TrainingSandbox):
-    """
-    Training Sandbox class for managing and executing training-related tasks.
-
-    This class provides methods to create, manage, and interact with
-    training environment instances using specialized tool calls.
-    """
-
-    def __init__(
-        self,
-        sandbox_id: Optional[str] = None,
-        timeout: int = 3000,
-        base_url: Optional[str] = None,
-        bearer_token: Optional[str] = None,
-        sandbox_type: SandboxType = SandboxType.WEBSHOP,
     ):
         """
         Initialize the Training Sandbox.
