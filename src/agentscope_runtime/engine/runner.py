@@ -216,21 +216,22 @@ class Runner:
         if isinstance(request, dict):
             request = AgentRequest(**request)
 
+        # Assign session ID
+        request.session_id = request.session_id or str(uuid.uuid4())
+
+        # Assign user ID
+        request.user_id = request.user_id or request.session_id
+
         seq_gen = SequenceNumberGenerator()
 
         # Initial response
         response = AgentResponse(id=request.id)
+        response.session_id = request.session_id
         yield seq_gen.yield_with_sequence(response)
 
         # Set to in-progress status
         response.in_progress()
         yield seq_gen.yield_with_sequence(response)
-
-        # Assign session ID
-        request.session_id = request.session_id or str(uuid.uuid4())
-
-        # Assign user ID
-        request.user_id = request.session_id or request.session_id
 
         query_kwargs = {
             "request": request,
@@ -249,6 +250,16 @@ class Runner:
             stream_adapter = adapt_agentscope_message_stream
             kwargs.update(
                 {"msgs": message_to_agentscope_msg(request.input)},
+            )
+        elif self.framework_type == "langgraph":
+            from ..adapters.langgraph.stream import (
+                adapt_langgraph_message_stream,
+            )
+            from ..adapters.langgraph.message import message_to_langgraph_msg
+
+            stream_adapter = adapt_langgraph_message_stream
+            kwargs.update(
+                {"msgs": message_to_langgraph_msg(request.input)},
             )
         # TODO: support other frameworks
         else:
