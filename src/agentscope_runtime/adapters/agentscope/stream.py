@@ -3,13 +3,15 @@
 import copy
 import json
 
-from typing import AsyncIterator, Tuple, List
+from typing import AsyncIterator, Tuple, List, Union
 from urllib.parse import urlparse
 
+from agentscope import setup_logger
 from agentscope.message import Msg
 
 from ...engine.schemas.agent_schemas import (
     Message,
+    Content,
     TextContent,
     ImageContent,
     AudioContent,
@@ -21,6 +23,8 @@ from ...engine.schemas.agent_schemas import (
     MessageType,
 )
 
+setup_logger("ERROR")
+
 
 def _update_obj_attrs(obj, **attrs):
     for key, value in attrs.items():
@@ -31,7 +35,7 @@ def _update_obj_attrs(obj, **attrs):
 
 async def adapt_agentscope_message_stream(
     source_stream: AsyncIterator[Tuple[Msg, bool]],
-) -> AsyncIterator[Message]:
+) -> AsyncIterator[Union[Message, Content]]:
     # Initialize variables to avoid uncaught errors
     msg_id = None
     last_content = ""
@@ -93,10 +97,9 @@ async def adapt_agentscope_message_stream(
                 else:
                     new_tool_blocks.append(block)
             if new_tool_blocks:
-                if tool_start:
+                if tool_start:  # Only for close the last msg
                     msg.content = new_tool_blocks
                 else:
-                    msg.content = new_blocks
                     tool_start = True
 
             else:
@@ -381,10 +384,16 @@ async def adapt_agentscope_message_stream(
                             ] = plugin_output_message
 
                         # Update output
-                        json_str = json.dumps(
-                            element.get("output"),
-                            ensure_ascii=False,
-                        )
+                        try:
+                            json_str = json.dumps(
+                                element.get("output"),
+                                ensure_ascii=False,
+                            )
+                        except Exception:
+                            # For non-JSON outputs, we just use the string
+                            # representation
+                            json_str = str(element.get("output"))
+
                         data_delta_content = DataContent(
                             index=None if last else 0,
                             data=fc_cls(
